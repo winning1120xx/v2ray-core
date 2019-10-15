@@ -3,30 +3,44 @@ package crypto
 import (
 	"crypto/cipher"
 	"io"
+	"math/rand"
 
 	"v2ray.com/core/common"
 	"v2ray.com/core/common/buf"
+	"v2ray.com/core/common/bytespool"
 	"v2ray.com/core/common/protocol"
 )
 
-type BytesGenerator interface {
-	Next() []byte
+type BytesGenerator func() []byte
+
+func GenerateEmptyBytes() BytesGenerator {
+	var b [1]byte
+	return func() []byte {
+		return b[:0]
+	}
 }
 
-type NoOpBytesGenerator struct {
-	buffer [1]byte
+func GenerateStaticBytes(content []byte) BytesGenerator {
+	return func() []byte {
+		return content
+	}
 }
 
-func (v NoOpBytesGenerator) Next() []byte {
-	return v.buffer[:0]
+func GenerateIncreasingNonce(nonce []byte) BytesGenerator {
+	c := append([]byte(nil), nonce...)
+	return func() []byte {
+		for i := range c {
+			c[i]++
+			if c[i] != 0 {
+				break
+			}
+		}
+		return c
+	}
 }
 
-type StaticBytesGenerator struct {
-	Content []byte
-}
-
-func (v StaticBytesGenerator) Next() []byte {
-	return v.Content
+func GenerateInitialAEADNonce() BytesGenerator {
+	return GenerateIncreasingNonce([]byte{0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF})
 }
 
 type Authenticator interface {
@@ -43,145 +57,163 @@ type AEADAuthenticator struct {
 }
 
 func (v *AEADAuthenticator) Open(dst, cipherText []byte) ([]byte, error) {
-	iv := v.NonceGenerator.Next()
+	iv := v.NonceGenerator()
 	if len(iv) != v.AEAD.NonceSize() {
 		return nil, newError("invalid AEAD nonce size: ", len(iv))
 	}
 
-	additionalData := v.AdditionalDataGenerator.Next()
+	var additionalData []byte
+	if v.AdditionalDataGenerator != nil {
+		additionalData = v.AdditionalDataGenerator()
+	}
 	return v.AEAD.Open(dst, iv, cipherText, additionalData)
 }
 
 func (v *AEADAuthenticator) Seal(dst, plainText []byte) ([]byte, error) {
-	iv := v.NonceGenerator.Next()
+	iv := v.NonceGenerator()
 	if len(iv) != v.AEAD.NonceSize() {
 		return nil, newError("invalid AEAD nonce size: ", len(iv))
 	}
 
-	additionalData := v.AdditionalDataGenerator.Next()
+	var additionalData []byte
+	if v.AdditionalDataGenerator != nil {
+		additionalData = v.AdditionalDataGenerator()
+	}
 	return v.AEAD.Seal(dst, iv, plainText, additionalData), nil
 }
 
 type AuthenticationReader struct {
 	auth         Authenticator
-	buffer       *buf.Buffer
-	reader       io.Reader
+	reader       *buf.BufferedReader
 	sizeParser   ChunkSizeDecoder
-	size         int
+	sizeBytes    []byte
 	transferType protocol.TransferType
+	padding      PaddingLengthGenerator
+	size         uint16
+	paddingLen   uint16
+	hasSize      bool
+	done         bool
 }
 
-const (
-	readerBufferSize = 32 * 1024
-)
-
-func NewAuthenticationReader(auth Authenticator, sizeParser ChunkSizeDecoder, reader io.Reader, transferType protocol.TransferType) *AuthenticationReader {
-	return &AuthenticationReader{
+func NewAuthenticationReader(auth Authenticator, sizeParser ChunkSizeDecoder, reader io.Reader, transferType protocol.TransferType, paddingLen PaddingLengthGenerator) *AuthenticationReader {
+	r := &AuthenticationReader{
 		auth:         auth,
-		buffer:       buf.NewLocal(readerBufferSize),
-		reader:       reader,
 		sizeParser:   sizeParser,
-		size:         -1,
 		transferType: transferType,
+		padding:      paddingLen,
+		sizeBytes:    make([]byte, sizeParser.SizeBytes()),
 	}
+	if breader, ok := reader.(*buf.BufferedReader); ok {
+		r.reader = breader
+	} else {
+		r.reader = &buf.BufferedReader{Reader: buf.NewReader(reader)}
+	}
+	return r
 }
 
-func (r *AuthenticationReader) readSize() error {
-	if r.size >= 0 {
-		return nil
+func (r *AuthenticationReader) readSize() (uint16, uint16, error) {
+	if r.hasSize {
+		r.hasSize = false
+		return r.size, r.paddingLen, nil
 	}
-
-	sizeBytes := r.sizeParser.SizeBytes()
-	if r.buffer.Len() < sizeBytes {
-		r.buffer.Reset(buf.ReadFrom(r.buffer))
-		delta := sizeBytes - r.buffer.Len()
-		if err := r.buffer.AppendSupplier(buf.ReadAtLeastFrom(r.reader, delta)); err != nil {
-			return err
-		}
+	if _, err := io.ReadFull(r.reader, r.sizeBytes); err != nil {
+		return 0, 0, err
 	}
-	size, err := r.sizeParser.Decode(r.buffer.BytesTo(sizeBytes))
-	if err != nil {
-		return err
+	var padding uint16
+	if r.padding != nil {
+		padding = r.padding.NextPaddingLen()
 	}
-	r.size = int(size)
-	r.buffer.SliceFrom(sizeBytes)
-	return nil
+	size, err := r.sizeParser.Decode(r.sizeBytes)
+	return size, padding, err
 }
 
-func (r *AuthenticationReader) readChunk(waitForData bool) ([]byte, error) {
-	if err := r.readSize(); err != nil {
+var errSoft = newError("waiting for more data")
+
+func (r *AuthenticationReader) readBuffer(size int32, padding int32) (*buf.Buffer, error) {
+	b := buf.New()
+	if _, err := b.ReadFullFrom(r.reader, size); err != nil {
+		b.Release()
 		return nil, err
 	}
-	if r.size > readerBufferSize-r.sizeParser.SizeBytes() {
-		return nil, newError("size too large ", r.size).AtWarning()
-	}
-
-	if r.size == r.auth.Overhead() {
-		return nil, io.EOF
-	}
-
-	if r.buffer.Len() < r.size {
-		if !waitForData {
-			return nil, io.ErrNoProgress
-		}
-
-		if r.buffer.IsEmpty() {
-			r.buffer.Clear()
-		} else {
-			common.Must(r.buffer.Reset(buf.ReadFrom(r.buffer)))
-		}
-
-		delta := r.size - r.buffer.Len()
-		if err := r.buffer.AppendSupplier(buf.ReadAtLeastFrom(r.reader, delta)); err != nil {
-			return nil, err
-		}
-	}
-
-	b, err := r.auth.Open(r.buffer.BytesTo(0), r.buffer.BytesTo(r.size))
+	size -= padding
+	rb, err := r.auth.Open(b.BytesTo(0), b.BytesTo(size))
 	if err != nil {
+		b.Release()
 		return nil, err
 	}
-	r.buffer.SliceFrom(r.size)
-	r.size = -1
+	b.Resize(0, int32(len(rb)))
 	return b, nil
 }
 
-func (r *AuthenticationReader) Read() (buf.MultiBuffer, error) {
-	b, err := r.readChunk(true)
+func (r *AuthenticationReader) readInternal(soft bool, mb *buf.MultiBuffer) error {
+	if soft && r.reader.BufferedBytes() < r.sizeParser.SizeBytes() {
+		return errSoft
+	}
+
+	if r.done {
+		return io.EOF
+	}
+
+	size, padding, err := r.readSize()
 	if err != nil {
+		return err
+	}
+
+	if size == uint16(r.auth.Overhead())+padding {
+		r.done = true
+		return io.EOF
+	}
+
+	if soft && int32(size) > r.reader.BufferedBytes() {
+		r.size = size
+		r.paddingLen = padding
+		r.hasSize = true
+		return errSoft
+	}
+
+	if size <= buf.Size {
+		b, err := r.readBuffer(int32(size), int32(padding))
+		if err != nil {
+			return nil
+		}
+		*mb = append(*mb, b)
+		return nil
+	}
+
+	payload := bytespool.Alloc(int32(size))
+	defer bytespool.Free(payload)
+
+	if _, err := io.ReadFull(r.reader, payload[:size]); err != nil {
+		return err
+	}
+
+	size -= padding
+
+	rb, err := r.auth.Open(payload[:0], payload[:size])
+	if err != nil {
+		return err
+	}
+
+	*mb = buf.MergeBytes(*mb, rb)
+	return nil
+}
+
+func (r *AuthenticationReader) ReadMultiBuffer() (buf.MultiBuffer, error) {
+	const readSize = 16
+	mb := make(buf.MultiBuffer, 0, readSize)
+	if err := r.readInternal(false, &mb); err != nil {
+		buf.ReleaseMulti(mb)
 		return nil, err
 	}
 
-	mb := buf.NewMultiBuffer()
-	if r.transferType == protocol.TransferTypeStream {
-		mb.Write(b)
-	} else {
-		var bb *buf.Buffer
-		if len(b) < buf.Size {
-			bb = buf.New()
-		} else {
-			bb = buf.NewLocal(len(b))
-		}
-		bb.Append(b)
-		mb.Append(bb)
-	}
-
-	for r.buffer.Len() >= r.sizeParser.SizeBytes() {
-		b, err := r.readChunk(false)
-		if err != nil {
+	for i := 1; i < readSize; i++ {
+		err := r.readInternal(true, &mb)
+		if err == errSoft || err == io.EOF {
 			break
 		}
-		if r.transferType == protocol.TransferTypeStream {
-			mb.Write(b)
-		} else {
-			var bb *buf.Buffer
-			if len(b) < buf.Size {
-				bb = buf.New()
-			} else {
-				bb = buf.NewLocal(len(b))
-			}
-			bb.Append(b)
-			mb.Append(bb)
+		if err != nil {
+			buf.ReleaseMulti(mb)
+			return nil, err
 		}
 	}
 
@@ -190,79 +222,120 @@ func (r *AuthenticationReader) Read() (buf.MultiBuffer, error) {
 
 type AuthenticationWriter struct {
 	auth         Authenticator
-	buffer       []byte
-	payload      []byte
-	writer       *buf.BufferedWriter
+	writer       buf.Writer
 	sizeParser   ChunkSizeEncoder
 	transferType protocol.TransferType
+	padding      PaddingLengthGenerator
 }
 
-func NewAuthenticationWriter(auth Authenticator, sizeParser ChunkSizeEncoder, writer io.Writer, transferType protocol.TransferType) *AuthenticationWriter {
-	const payloadSize = 1024
-	return &AuthenticationWriter{
+func NewAuthenticationWriter(auth Authenticator, sizeParser ChunkSizeEncoder, writer io.Writer, transferType protocol.TransferType, padding PaddingLengthGenerator) *AuthenticationWriter {
+	w := &AuthenticationWriter{
 		auth:         auth,
-		buffer:       make([]byte, payloadSize+sizeParser.SizeBytes()+auth.Overhead()),
-		payload:      make([]byte, payloadSize),
-		writer:       buf.NewBufferedWriterSize(writer, readerBufferSize),
+		writer:       buf.NewWriter(writer),
 		sizeParser:   sizeParser,
 		transferType: transferType,
 	}
+	if padding != nil {
+		w.padding = padding
+	}
+	return w
 }
 
-func (w *AuthenticationWriter) append(b []byte) error {
-	encryptedSize := len(b) + w.auth.Overhead()
-	buffer := w.sizeParser.Encode(uint16(encryptedSize), w.buffer[:0])
-
-	buffer, err := w.auth.Seal(buffer, b)
-	if err != nil {
-		return err
+func (w *AuthenticationWriter) seal(b []byte) (*buf.Buffer, error) {
+	encryptedSize := int32(len(b) + w.auth.Overhead())
+	var paddingSize int32
+	if w.padding != nil {
+		paddingSize = int32(w.padding.NextPaddingLen())
 	}
 
-	if _, err := w.writer.Write(buffer); err != nil {
-		return err
+	totalSize := encryptedSize + paddingSize
+	if totalSize > buf.Size {
+		return nil, newError("size too large: ", totalSize)
 	}
 
-	return nil
+	eb := buf.New()
+	w.sizeParser.Encode(uint16(encryptedSize+paddingSize), eb.Extend(w.sizeParser.SizeBytes()))
+	if _, err := w.auth.Seal(eb.Extend(encryptedSize)[:0], b); err != nil {
+		eb.Release()
+		return nil, err
+	}
+	if paddingSize > 0 {
+		// With size of the chunk and padding length encrypted, the content of padding doesn't matter much.
+		paddingBytes := eb.Extend(paddingSize)
+		common.Must2(rand.Read(paddingBytes))
+	}
+
+	return eb, nil
 }
 
 func (w *AuthenticationWriter) writeStream(mb buf.MultiBuffer) error {
-	defer mb.Release()
+	defer buf.ReleaseMulti(mb)
+
+	var maxPadding int32
+	if w.padding != nil {
+		maxPadding = int32(w.padding.MaxPaddingLen())
+	}
+
+	payloadSize := buf.Size - int32(w.auth.Overhead()) - w.sizeParser.SizeBytes() - maxPadding
+	mb2Write := make(buf.MultiBuffer, 0, len(mb)+10)
+
+	temp := buf.New()
+	defer temp.Release()
+
+	rawBytes := temp.Extend(payloadSize)
 
 	for {
-		n, _ := mb.Read(w.payload)
-		if err := w.append(w.payload[:n]); err != nil {
+		nb, nBytes := buf.SplitBytes(mb, rawBytes)
+		mb = nb
+
+		eb, err := w.seal(rawBytes[:nBytes])
+
+		if err != nil {
+			buf.ReleaseMulti(mb2Write)
 			return err
 		}
+		mb2Write = append(mb2Write, eb)
 		if mb.IsEmpty() {
 			break
 		}
 	}
 
-	return w.writer.Flush()
+	return w.writer.WriteMultiBuffer(mb2Write)
 }
 
 func (w *AuthenticationWriter) writePacket(mb buf.MultiBuffer) error {
-	defer mb.Release()
+	defer buf.ReleaseMulti(mb)
 
-	for {
-		b := mb.SplitFirst()
-		if b == nil {
-			b = buf.New()
+	mb2Write := make(buf.MultiBuffer, 0, len(mb)+1)
+
+	for _, b := range mb {
+		if b.IsEmpty() {
+			continue
 		}
-		if err := w.append(b.Bytes()); err != nil {
-			b.Release()
-			return err
+
+		eb, err := w.seal(b.Bytes())
+		if err != nil {
+			continue
 		}
-		b.Release()
-		if mb.IsEmpty() {
-			break
-		}
+
+		mb2Write = append(mb2Write, eb)
 	}
 
-	return w.writer.Flush()
+	if mb2Write.IsEmpty() {
+		return nil
+	}
+
+	return w.writer.WriteMultiBuffer(mb2Write)
 }
 
-func (w *AuthenticationWriter) Write(mb buf.MultiBuffer) error {
+// WriteMultiBuffer implements buf.Writer.
+func (w *AuthenticationWriter) WriteMultiBuffer(mb buf.MultiBuffer) error {
+	if mb.IsEmpty() {
+		eb, err := w.seal([]byte{})
+		common.Must(err)
+		return w.writer.WriteMultiBuffer(buf.MultiBuffer{eb})
+	}
+
 	if w.transferType == protocol.TransferTypeStream {
 		return w.writeStream(mb)
 	}

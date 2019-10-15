@@ -1,10 +1,9 @@
 package net
 
 import (
+	"bytes"
 	"net"
-
-	"v2ray.com/core/app/log"
-	"v2ray.com/core/common/predicate"
+	"strings"
 )
 
 var (
@@ -19,10 +18,13 @@ var (
 
 	// LocalHostIPv6 is a constant value for localhost IP in IPv6.
 	LocalHostIPv6 = IPAddress([]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1})
+
+	// AnyIPv6 is a constant value for any IP in IPv6.
+	AnyIPv6 = IPAddress([]byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0})
 )
 
 // AddressFamily is the type of address.
-type AddressFamily int
+type AddressFamily byte
 
 const (
 	// AddressFamilyIPv4 represents address as IPv4
@@ -35,25 +37,24 @@ const (
 	AddressFamilyDomain = AddressFamily(2)
 )
 
-func (v AddressFamily) Either(fs ...AddressFamily) bool {
-	for _, f := range fs {
-		if v == f {
-			return true
-		}
-	}
-	return false
+// IsIPv4 returns true if current AddressFamily is IPv4.
+func (af AddressFamily) IsIPv4() bool {
+	return af == AddressFamilyIPv4
 }
 
-func (v AddressFamily) IsIPv4() bool {
-	return v == AddressFamilyIPv4
+// IsIPv6 returns true if current AddressFamily is IPv6.
+func (af AddressFamily) IsIPv6() bool {
+	return af == AddressFamilyIPv6
 }
 
-func (v AddressFamily) IsIPv6() bool {
-	return v == AddressFamilyIPv6
+// IsIP returns true if current AddressFamily is IPv6 or IPv4.
+func (af AddressFamily) IsIP() bool {
+	return af == AddressFamilyIPv4 || af == AddressFamilyIPv6
 }
 
-func (v AddressFamily) IsDomain() bool {
-	return v == AddressFamilyDomain
+// IsDomain returns true if current AddressFamily is Domain.
+func (af AddressFamily) IsDomain() bool {
+	return af == AddressFamilyDomain
 }
 
 // Address represents a network address to be communicated with. It may be an IP address or domain
@@ -66,15 +67,32 @@ type Address interface {
 	String() string // String representation of this Address
 }
 
+func isAlphaNum(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
 // ParseAddress parses a string into an Address. The return value will be an IPAddress when
 // the string is in the form of IPv4 or IPv6 address, or a DomainAddress otherwise.
 func ParseAddress(addr string) Address {
+	// Handle IPv6 address in form as "[2001:4860:0:2001::68]"
+	lenAddr := len(addr)
+	if lenAddr > 0 && addr[0] == '[' && addr[lenAddr-1] == ']' {
+		addr = addr[1 : lenAddr-1]
+		lenAddr -= 2
+	}
+
+	if lenAddr > 0 && (!isAlphaNum(addr[0]) || !isAlphaNum(addr[len(addr)-1])) {
+		addr = strings.TrimSpace(addr)
+	}
+
 	ip := net.ParseIP(addr)
 	if ip != nil {
 		return IPAddress(ip)
 	}
 	return DomainAddress(addr)
 }
+
+var bytes0 = []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0}
 
 // IPAddress creates an Address with given IP.
 func IPAddress(ip []byte) Address {
@@ -83,7 +101,7 @@ func IPAddress(ip []byte) Address {
 		var addr ipv4Address = [4]byte{ip[0], ip[1], ip[2], ip[3]}
 		return addr
 	case net.IPv6len:
-		if predicate.BytesAll(ip[0:10], 0) && predicate.BytesAll(ip[10:12], 0xff) {
+		if bytes.Equal(ip[:10], bytes0) && ip[10] == 0xff && ip[11] == 0xff {
 			return IPAddress(ip[12:16])
 		}
 		var addr ipv6Address = [16]byte{
@@ -94,7 +112,7 @@ func IPAddress(ip []byte) Address {
 		}
 		return addr
 	default:
-		log.Trace(newError("invalid IP format: ", ip).AtError())
+		newError("invalid IP format: ", ip).AtError().WriteToLog()
 		return nil
 	}
 }
@@ -106,8 +124,8 @@ func DomainAddress(domain string) Address {
 
 type ipv4Address [4]byte
 
-func (v ipv4Address) IP() net.IP {
-	return net.IP(v[:])
+func (a ipv4Address) IP() net.IP {
+	return net.IP(a[:])
 }
 
 func (ipv4Address) Domain() string {
@@ -118,14 +136,14 @@ func (ipv4Address) Family() AddressFamily {
 	return AddressFamilyIPv4
 }
 
-func (v ipv4Address) String() string {
-	return v.IP().String()
+func (a ipv4Address) String() string {
+	return a.IP().String()
 }
 
 type ipv6Address [16]byte
 
-func (v ipv6Address) IP() net.IP {
-	return net.IP(v[:])
+func (a ipv6Address) IP() net.IP {
+	return net.IP(a[:])
 }
 
 func (ipv6Address) Domain() string {
@@ -136,8 +154,8 @@ func (ipv6Address) Family() AddressFamily {
 	return AddressFamilyIPv6
 }
 
-func (v ipv6Address) String() string {
-	return "[" + v.IP().String() + "]"
+func (a ipv6Address) String() string {
+	return "[" + a.IP().String() + "]"
 }
 
 type domainAddress string
@@ -146,23 +164,24 @@ func (domainAddress) IP() net.IP {
 	panic("Calling IP() on a DomainAddress.")
 }
 
-func (v domainAddress) Domain() string {
-	return string(v)
+func (a domainAddress) Domain() string {
+	return string(a)
 }
 
 func (domainAddress) Family() AddressFamily {
 	return AddressFamilyDomain
 }
 
-func (v domainAddress) String() string {
-	return v.Domain()
+func (a domainAddress) String() string {
+	return a.Domain()
 }
 
-func (v *IPOrDomain) AsAddress() Address {
-	if v == nil {
+// AsAddress translates IPOrDomain to Address.
+func (d *IPOrDomain) AsAddress() Address {
+	if d == nil {
 		return nil
 	}
-	switch addr := v.Address.(type) {
+	switch addr := d.Address.(type) {
 	case *IPOrDomain_Ip:
 		return IPAddress(addr.Ip)
 	case *IPOrDomain_Domain:
@@ -171,6 +190,7 @@ func (v *IPOrDomain) AsAddress() Address {
 	panic("Common|Net: Invalid address.")
 }
 
+// NewIPOrDomain translates Address to IPOrDomain
 func NewIPOrDomain(addr Address) *IPOrDomain {
 	switch addr.Family() {
 	case AddressFamilyDomain:

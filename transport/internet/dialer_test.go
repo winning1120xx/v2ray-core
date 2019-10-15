@@ -4,22 +4,24 @@ import (
 	"context"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+
+	"v2ray.com/core/common"
 	"v2ray.com/core/common/net"
-	"v2ray.com/core/testing/assert"
 	"v2ray.com/core/testing/servers/tcp"
 	. "v2ray.com/core/transport/internet"
 )
 
 func TestDialWithLocalAddr(t *testing.T) {
-	assert := assert.On(t)
-
 	server := &tcp.Server{}
 	dest, err := server.Start()
-	assert.Error(err).IsNil()
+	common.Must(err)
 	defer server.Close()
 
-	conn, err := DialSystem(context.Background(), net.LocalHostIP, net.TCPDestination(net.LocalHostIP, dest.Port))
-	assert.Error(err).IsNil()
-	assert.String(conn.RemoteAddr().String()).Equals("127.0.0.1:" + dest.Port.String())
+	conn, err := DialSystem(context.Background(), net.TCPDestination(net.LocalHostIP, dest.Port), nil)
+	common.Must(err)
+	if r := cmp.Diff(conn.RemoteAddr().String(), "127.0.0.1:"+dest.Port.String()); r != "" {
+		t.Error(r)
+	}
 	conn.Close()
 }

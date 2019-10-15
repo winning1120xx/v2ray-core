@@ -1,68 +1,156 @@
 package encoding_test
 
 import (
-	"context"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+
+	"v2ray.com/core/common"
 	"v2ray.com/core/common/buf"
-	v2net "v2ray.com/core/common/net"
+	"v2ray.com/core/common/net"
 	"v2ray.com/core/common/protocol"
-	"v2ray.com/core/common/serial"
 	"v2ray.com/core/common/uuid"
 	"v2ray.com/core/proxy/vmess"
 	. "v2ray.com/core/proxy/vmess/encoding"
-	"v2ray.com/core/testing/assert"
 )
 
-func TestRequestSerialization(t *testing.T) {
-	assert := assert.On(t)
+func toAccount(a *vmess.Account) protocol.Account {
+	account, err := a.AsAccount()
+	common.Must(err)
+	return account
+}
 
-	user := &protocol.User{
+func TestRequestSerialization(t *testing.T) {
+	user := &protocol.MemoryUser{
 		Level: 0,
 		Email: "test@v2ray.com",
 	}
+	id := uuid.New()
 	account := &vmess.Account{
-		Id:      uuid.New().String(),
+		Id:      id.String(),
 		AlterId: 0,
 	}
-	user.Account = serial.ToTypedMessage(account)
+	user.Account = toAccount(account)
 
 	expectedRequest := &protocol.RequestHeader{
 		Version:  1,
 		User:     user,
 		Command:  protocol.RequestCommandTCP,
-		Address:  v2net.DomainAddress("www.v2ray.com"),
-		Port:     v2net.Port(443),
-		Security: protocol.Security(protocol.SecurityType_AES128_GCM),
+		Address:  net.DomainAddress("www.v2ray.com"),
+		Port:     net.Port(443),
+		Security: protocol.SecurityType_AES128_GCM,
 	}
 
 	buffer := buf.New()
 	client := NewClientSession(protocol.DefaultIDHash)
-	client.EncodeRequestHeader(expectedRequest, buffer)
+	common.Must(client.EncodeRequestHeader(expectedRequest, buffer))
 
 	buffer2 := buf.New()
-	buffer2.Append(buffer.Bytes())
+	buffer2.Write(buffer.Bytes())
 
-	ctx, cancel := context.WithCancel(context.Background())
-	sessionHistory := NewSessionHistory(ctx)
+	sessionHistory := NewSessionHistory()
+	defer common.Close(sessionHistory)
 
-	userValidator := vmess.NewTimedUserValidator(ctx, protocol.DefaultIDHash)
+	userValidator := vmess.NewTimedUserValidator(protocol.DefaultIDHash)
 	userValidator.Add(user)
+	defer common.Close(userValidator)
 
 	server := NewServerSession(userValidator, sessionHistory)
 	actualRequest, err := server.DecodeRequestHeader(buffer)
-	assert.Error(err).IsNil()
+	common.Must(err)
 
-	assert.Byte(expectedRequest.Version).Equals(actualRequest.Version)
-	assert.Byte(byte(expectedRequest.Command)).Equals(byte(actualRequest.Command))
-	assert.Byte(byte(expectedRequest.Option)).Equals(byte(actualRequest.Option))
-	assert.Address(expectedRequest.Address).Equals(actualRequest.Address)
-	assert.Port(expectedRequest.Port).Equals(actualRequest.Port)
-	assert.Byte(byte(expectedRequest.Security)).Equals(byte(actualRequest.Security))
+	if r := cmp.Diff(actualRequest, expectedRequest, cmp.AllowUnexported(protocol.ID{})); r != "" {
+		t.Error(r)
+	}
 
 	_, err = server.DecodeRequestHeader(buffer2)
 	// anti replay attack
-	assert.Error(err).IsNotNil()
+	if err == nil {
+		t.Error("nil error")
+	}
+}
 
-	cancel()
+func TestInvalidRequest(t *testing.T) {
+	user := &protocol.MemoryUser{
+		Level: 0,
+		Email: "test@v2ray.com",
+	}
+	id := uuid.New()
+	account := &vmess.Account{
+		Id:      id.String(),
+		AlterId: 0,
+	}
+	user.Account = toAccount(account)
+
+	expectedRequest := &protocol.RequestHeader{
+		Version:  1,
+		User:     user,
+		Command:  protocol.RequestCommand(100),
+		Address:  net.DomainAddress("www.v2ray.com"),
+		Port:     net.Port(443),
+		Security: protocol.SecurityType_AES128_GCM,
+	}
+
+	buffer := buf.New()
+	client := NewClientSession(protocol.DefaultIDHash)
+	common.Must(client.EncodeRequestHeader(expectedRequest, buffer))
+
+	buffer2 := buf.New()
+	buffer2.Write(buffer.Bytes())
+
+	sessionHistory := NewSessionHistory()
+	defer common.Close(sessionHistory)
+
+	userValidator := vmess.NewTimedUserValidator(protocol.DefaultIDHash)
+	userValidator.Add(user)
+	defer common.Close(userValidator)
+
+	server := NewServerSession(userValidator, sessionHistory)
+	_, err := server.DecodeRequestHeader(buffer)
+	if err == nil {
+		t.Error("nil error")
+	}
+}
+
+func TestMuxRequest(t *testing.T) {
+	user := &protocol.MemoryUser{
+		Level: 0,
+		Email: "test@v2ray.com",
+	}
+	id := uuid.New()
+	account := &vmess.Account{
+		Id:      id.String(),
+		AlterId: 0,
+	}
+	user.Account = toAccount(account)
+
+	expectedRequest := &protocol.RequestHeader{
+		Version:  1,
+		User:     user,
+		Command:  protocol.RequestCommandMux,
+		Security: protocol.SecurityType_AES128_GCM,
+		Address:  net.DomainAddress("v1.mux.cool"),
+	}
+
+	buffer := buf.New()
+	client := NewClientSession(protocol.DefaultIDHash)
+	common.Must(client.EncodeRequestHeader(expectedRequest, buffer))
+
+	buffer2 := buf.New()
+	buffer2.Write(buffer.Bytes())
+
+	sessionHistory := NewSessionHistory()
+	defer common.Close(sessionHistory)
+
+	userValidator := vmess.NewTimedUserValidator(protocol.DefaultIDHash)
+	userValidator.Add(user)
+	defer common.Close(userValidator)
+
+	server := NewServerSession(userValidator, sessionHistory)
+	actualRequest, err := server.DecodeRequestHeader(buffer)
+	common.Must(err)
+
+	if r := cmp.Diff(actualRequest, expectedRequest, cmp.AllowUnexported(protocol.ID{})); r != "" {
+		t.Error(r)
+	}
 }

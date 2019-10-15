@@ -4,21 +4,24 @@ import (
 	"crypto/rand"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+
+	"v2ray.com/core/common"
 	. "v2ray.com/core/proxy/vmess/encoding"
-	"v2ray.com/core/testing/assert"
 )
 
 func TestFnvAuth(t *testing.T) {
-	assert := assert.On(t)
 	fnvAuth := new(FnvAuthenticator)
 
 	expectedText := make([]byte, 256)
-	rand.Read(expectedText)
+	_, err := rand.Read(expectedText)
+	common.Must(err)
 
 	buffer := make([]byte, 512)
 	b := fnvAuth.Seal(buffer[:0], nil, expectedText, nil)
-	b, err := fnvAuth.Open(buffer[:0], nil, b, nil)
-	assert.Error(err).IsNil()
-	assert.Int(len(b)).Equals(256)
-	assert.Bytes(b).Equals(expectedText)
+	b, err = fnvAuth.Open(buffer[:0], nil, b, nil)
+	common.Must(err)
+	if r := cmp.Diff(b, expectedText); r != "" {
+		t.Error(r)
+	}
 }

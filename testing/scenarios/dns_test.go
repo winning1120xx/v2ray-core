@@ -3,37 +3,36 @@ package scenarios
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	xproxy "golang.org/x/net/proxy"
 	"v2ray.com/core"
 	"v2ray.com/core/app/dns"
 	"v2ray.com/core/app/proxyman"
 	"v2ray.com/core/app/router"
-	v2net "v2ray.com/core/common/net"
+	"v2ray.com/core/common"
+	"v2ray.com/core/common/net"
 	"v2ray.com/core/common/serial"
 	"v2ray.com/core/proxy/blackhole"
 	"v2ray.com/core/proxy/freedom"
 	"v2ray.com/core/proxy/socks"
-	"v2ray.com/core/testing/assert"
 	"v2ray.com/core/testing/servers/tcp"
 )
 
 func TestResolveIP(t *testing.T) {
-	assert := assert.On(t)
-
 	tcpServer := tcp.Server{
 		MsgProcessor: xor,
 	}
 	dest, err := tcpServer.Start()
-	assert.Error(err).IsNil()
+	common.Must(err)
 	defer tcpServer.Close()
 
-	serverPort := pickPort()
+	serverPort := tcp.PickPort()
 	serverConfig := &core.Config{
 		App: []*serial.TypedMessage{
 			serial.ToTypedMessage(&dns.Config{
-				Hosts: map[string]*v2net.IPOrDomain{
-					"google.com": v2net.NewIPOrDomain(dest.Address),
+				Hosts: map[string]*net.IPOrDomain{
+					"google.com": net.NewIPOrDomain(dest.Address),
 				},
 			}),
 			serial.ToTypedMessage(&router.Config{
@@ -46,28 +45,30 @@ func TestResolveIP(t *testing.T) {
 								Prefix: 8,
 							},
 						},
-						Tag: "direct",
+						TargetTag: &router.RoutingRule_Tag{
+							Tag: "direct",
+						},
 					},
 				},
 			}),
 		},
-		Inbound: []*proxyman.InboundHandlerConfig{
+		Inbound: []*core.InboundHandlerConfig{
 			{
 				ReceiverSettings: serial.ToTypedMessage(&proxyman.ReceiverConfig{
-					PortRange: v2net.SinglePortRange(serverPort),
-					Listen:    v2net.NewIPOrDomain(v2net.LocalHostIP),
+					PortRange: net.SinglePortRange(serverPort),
+					Listen:    net.NewIPOrDomain(net.LocalHostIP),
 				}),
 				ProxySettings: serial.ToTypedMessage(&socks.ServerConfig{
 					AuthType: socks.AuthType_NO_AUTH,
 					Accounts: map[string]string{
 						"Test Account": "Test Password",
 					},
-					Address:    v2net.NewIPOrDomain(v2net.LocalHostIP),
+					Address:    net.NewIPOrDomain(net.LocalHostIP),
 					UdpEnabled: false,
 				}),
 			},
 		},
-		Outbound: []*proxyman.OutboundHandlerConfig{
+		Outbound: []*core.OutboundHandlerConfig{
 			{
 				ProxySettings: serial.ToTypedMessage(&blackhole.Config{}),
 			},
@@ -81,25 +82,18 @@ func TestResolveIP(t *testing.T) {
 	}
 
 	servers, err := InitializeServerConfigs(serverConfig)
-	assert.Error(err).IsNil()
+	common.Must(err)
+	defer CloseAllServers(servers)
 
 	{
-		noAuthDialer, err := xproxy.SOCKS5("tcp", v2net.TCPDestination(v2net.LocalHostIP, serverPort).NetAddr(), nil, xproxy.Direct)
-		assert.Error(err).IsNil()
+		noAuthDialer, err := xproxy.SOCKS5("tcp", net.TCPDestination(net.LocalHostIP, serverPort).NetAddr(), nil, xproxy.Direct)
+		common.Must(err)
 		conn, err := noAuthDialer.Dial("tcp", fmt.Sprintf("google.com:%d", dest.Port))
-		assert.Error(err).IsNil()
+		common.Must(err)
+		defer conn.Close()
 
-		payload := "test payload"
-		nBytes, err := conn.Write([]byte(payload))
-		assert.Error(err).IsNil()
-		assert.Int(nBytes).Equals(len(payload))
-
-		response := make([]byte, 1024)
-		nBytes, err = conn.Read(response)
-		assert.Error(err).IsNil()
-		assert.Bytes(response[:nBytes]).Equals(xor([]byte(payload)))
-		assert.Error(conn.Close()).IsNil()
+		if err := testTCPConn2(conn, 1024, time.Second*5)(); err != nil {
+			t.Error(err)
+		}
 	}
-
-	CloseAllServers(servers)
 }

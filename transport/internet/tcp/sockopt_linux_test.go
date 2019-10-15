@@ -7,23 +7,26 @@ import (
 	"strings"
 	"testing"
 
-	"v2ray.com/core/testing/assert"
+	"v2ray.com/core/common"
 	"v2ray.com/core/testing/servers/tcp"
+	"v2ray.com/core/transport/internet"
 	. "v2ray.com/core/transport/internet/tcp"
 )
 
 func TestGetOriginalDestination(t *testing.T) {
-	assert := assert.On(t)
-
 	tcpServer := tcp.Server{}
 	dest, err := tcpServer.Start()
-	assert.Error(err).IsNil()
+	common.Must(err)
 	defer tcpServer.Close()
 
-	conn, err := Dial(context.Background(), dest)
-	assert.Error(err).IsNil()
+	config, err := internet.ToMemoryStreamConfig(nil)
+	common.Must(err)
+	conn, err := Dial(context.Background(), dest, config)
+	common.Must(err)
 	defer conn.Close()
 
 	originalDest, err := GetOriginalDestination(conn)
-	assert.Bool(dest == originalDest || strings.Contains(err.Error(), "failed to call getsockopt"))
+	if !(dest == originalDest || strings.Contains(err.Error(), "failed to call getsockopt")) {
+		t.Error("unexpected state")
+	}
 }
